@@ -86,7 +86,7 @@ def process(book):
     dst = DST if med else DST_GUJI
     prefix = f"book/{bid}/" if med else f"naj/{bid}/"
     coll = "overseas" if med else "overseas_guji"
-    vis = 1 if med else 0
+    vis = 1                                                              # CC 2026-06-14: 医/非医都 vis=1(collection 隔离两版块·都该显·海外古籍版块已上线)
     marker = f"{prefix}.done"
     try:
         s3.head_object(Bucket=dst, Key=marker); return "skip"            # idempotent
