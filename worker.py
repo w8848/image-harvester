@@ -2,12 +2,15 @@
 # Edge-proxied IIIF fetch -> WebP -> object store -> index. Idempotent (skip on .done marker).
 # Single item:  worker.py --id <id> --manifest <url> --title "<t>"
 # Sharded run:  worker.py --shard N --total M   (reads worklist.csv from private bucket)
+# CC 2026-06-14 自动分流:worklist 带 is_med 列,worker 按它落位 —— 医→guyaofang-lib/book/+overseas;
+#   非医→guji-sea/naj/+overseas_guji+不前台显示(等 guji-oversea 版块上线再放)。抓取即货对板,不再事后筛移。
 import os, sys, io, re, csv, json, time, argparse, urllib.parse, requests, boto3
 
-PROXY = os.environ["EDGE_PROXY"]                      # e.g. https://x.example.dev/fetch?url=
+PROXY = os.environ["EDGE_PROXY"]                         # e.g. https://x.example.dev/fetch?url=
 EP, AK, SK = os.environ["R2_ENDPOINT"], os.environ["R2_KEY"], os.environ["R2_SECRET"]
 ACC, DB, TOK = os.environ["CF_ACCOUNT"], os.environ["CF_D1_DB"], os.environ["CF_D1_TOKEN"]
-DST = os.environ.get("DST_BUCKET", "guyaofang-lib")
+DST = os.environ.get("DST_BUCKET", "guyaofang-lib")          # 医书桶
+DST_GUJI = os.environ.get("DST_GUJI_BUCKET", "guji-sea")     # 非医→古籍海外桶(CC 2026-06-14)
 LIB = os.environ.get("LIB_NAME", "")
 LIST_BUCKET = os.environ.get("LIST_BUCKET", "")
 LIST_KEY = os.environ.get("LIST_KEY", "worklist.csv")
@@ -72,15 +75,21 @@ def extract_meta(m, req):
     author = dynasty = ""
     for lab, val in fields.items():
         if "Creator" in lab or "Author" in lab:
-            author = val.strip()
-            break
+            author = val.strip(); break
     return {"req": req, "source_url": m.get("@id") or m.get("id") or "",
             "author": author, "dynasty": dynasty, "fields": fields}
 
 def process(book):
-    bid = book["book_id"]; prefix = f"book/{bid}/"; marker = f"{prefix}.done"
+    bid = book["book_id"]
+    # CC 2026-06-14 自动分流:is_med 列(缺省按医,兼容旧清单)。医/非医落不同桶+不同 collection+前台可见性。
+    med = str(book.get("is_med", "1")).strip() != "0"
+    dst = DST if med else DST_GUJI
+    prefix = f"book/{bid}/" if med else f"naj/{bid}/"
+    coll = "overseas" if med else "overseas_guji"
+    vis = 1 if med else 0
+    marker = f"{prefix}.done"
     try:
-        s3.head_object(Bucket=DST, Key=marker); return "skip"            # idempotent
+        s3.head_object(Bucket=dst, Key=marker); return "skip"            # idempotent
     except Exception:
         pass
     m = gfetch(book["manifest"]).json()
@@ -89,21 +98,21 @@ def process(book):
     if n == 0:
         return "fail:no_pages"
     meta = extract_meta(m, book.get("req", ""))
-    for i, u in enumerate(urls, 1):                                       # all-or-nothing: any failure aborts (no partial register)
-        s3.put_object(Bucket=DST, Key=f"{prefix}page_{i:04d}.webp",
+    for i, u in enumerate(urls, 1):                                      # all-or-nothing: any failure aborts (no partial register)
+        s3.put_object(Bucket=dst, Key=f"{prefix}page_{i:04d}.webp",
                       Body=to_webp(gfetch(u).content), ContentType="image/webp")
     sql = ("INSERT OR REPLACE INTO books_assets_v2 (book_id, book_title, source_root, source_relative_path, "
            "webp_prefix, page_count, upload_status, webp_status, frontend_visible, rights_status, collection, "
            "req_no, part, category_code, library, author, dynasty, meta_json, created_at, updated_at) "
            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,strftime('%s','now'),strftime('%s','now'))")
-    p = [bid, book.get("title", bid), "lineb", f"lineb/{bid}", prefix, n, "done", "done", 1,
-         "public_domain", "overseas", book.get("req", ""), book.get("part", ""), book.get("cat", ""), book.get("lib", LIB),
+    p = [bid, book.get("title", bid), "lineb", f"lineb/{bid}", prefix, n, "done", "done", vis,
+         "public_domain", coll, book.get("req", ""), book.get("part", ""), book.get("cat", ""), book.get("lib", LIB),
          meta.get("author", ""), meta.get("dynasty", ""), json.dumps(meta, ensure_ascii=False)]
     r = d1(sql, p)
     if not (r.status_code == 200 and r.json().get("success")):
         return f"fail:d1 {r.text[:120]}"
-    s3.put_object(Bucket=DST, Key=marker, Body=b"1")
-    return f"ok:{n}p"
+    s3.put_object(Bucket=dst, Key=marker, Body=b"1")
+    return f"ok:{n}p {'med' if med else 'guji'}"
 
 def main():
     ap = argparse.ArgumentParser()
